@@ -12,7 +12,7 @@ ENGINE = $(CORE) $(HOST)
 METAL_LIBS = -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers
 
 TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
-        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_dt_fixup $(B)/test_shutdown
+        $(B)/test_mmu $(B)/test_net_queue $(B)/test_exc $(B)/test_devices $(B)/test_dt_fixup $(B)/test_shutdown
 
 all: $(TESTS) $(B)/hengevm $(B)/hengevm-ref $(B)/hvsparse
 
@@ -81,6 +81,9 @@ $(B)/test_classify: tests/test_classify.c tests/classify_cases.s $(B)/classify.o
 	$(CC) $(CFLAGS) $^ -o $@
 $(B)/test_jit_region: tests/test_jit_region.c $(B)/jit_region.o
 	$(CC) $(CFLAGS) $^ -o $@
+$(B)/test_net_queue: tests/test_net_queue.c host/net_queue.h | $(B)
+	$(CC) $(CFLAGS) tests/test_net_queue.c -o $@
+
 $(B)/test_operands: tests/test_operands.c tests/operand_cases.s $(B)/operands.o
 	$(CC) $(CFLAGS) $^ -o $@
 $(B)/test_mmu: tests/test_mmu.c $(ENGINE)
