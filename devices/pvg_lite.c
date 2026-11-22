@@ -35,6 +35,7 @@
 #include <os/lock.h>
 #include <stdatomic.h>
 #include "pvg_lite.h"
+#include "pvg_vblank_clock.h"
 #include <mach/mach_time.h>
 
 int hv_pvg_trace_on(void) {
@@ -713,7 +714,8 @@ static void do_mapper(HvPvgLite *p) {
    draws. Sent at the mode's rate while asked for. */
 static void vblank(HvPvgLite *p) {
     static int on = -1;
-    static uint64_t period, next;
+    static uint64_t period;
+    static HvVblankClock clock;
     if (on < 0) {
         on = getenv("HV_PVG_VBLANK") && atoi(getenv("HV_PVG_VBLANK"));
         const char *hz = getenv("HV_HZ");
@@ -724,8 +726,7 @@ static void vblank(HvPvgLite *p) {
     uint8_t *d = hv_phys_ptr(p->m, p->display_pa, 0x4000);
     if (!d || !(__atomic_load_n((uint32_t *)(d + 0x104), __ATOMIC_ACQUIRE) & 8)) return;
     uint64_t now = mach_absolute_time();
-    if (now < next) return;
-    next = now + period;
+    if (!hv_vblank_due(&clock, now, period)) return;
     __atomic_fetch_or((uint32_t *)(d + 0x100), 8, __ATOMIC_RELEASE);
     p->vblanks++;
     hv_gicv3_pend(p->gic, p->gfx_irq);
