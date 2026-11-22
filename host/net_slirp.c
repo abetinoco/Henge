@@ -9,6 +9,7 @@
    virtio-net device on the CPU thread (hv_net_poll), which may only take them
    when the guest has posted receive buffers. */
 #include "net_slirp.h"
+#include "net_queue.h"
 #include "dns_proxy.h"
 #include "share.h"
 
@@ -24,21 +25,12 @@
 #include <time.h>
 #include <unistd.h>
 
-#define QUEUE 512
 #define MAX_FRAME 65550
 #define MAX_TIMERS 64
 #define MAX_POLL 1024
 
-typedef struct Frame {
-    uint32_t len;
-    uint8_t *data;
-} Frame;
-
-typedef struct Queue {
-    Frame f[QUEUE];
-    uint32_t head, tail;
-    pthread_mutex_t mu;
-} Queue;
+typedef HvNetFrame Frame;
+typedef HvNetQueue Queue;
 
 typedef struct Timer {
     int used;
@@ -67,17 +59,7 @@ void hv_net_set_share_socket(const char *path) {
 }
 
 static int push(Queue *q, const uint8_t *data, uint32_t len) {
-    pthread_mutex_lock(&q->mu);
-    int ok = q->tail - q->head < QUEUE;
-    if (ok) {
-        Frame *f = &q->f[q->tail % QUEUE];
-        f->data = malloc(len);
-        memcpy(f->data, data, len);
-        f->len = len;
-        q->tail++;
-    }
-    pthread_mutex_unlock(&q->mu);
-    return ok;
+    return hv_netq_push(q, data, len);
 }
 
 /* HV_NET_LOG: one line per frame (ethertype, IP protocol, ports). */
@@ -227,10 +209,7 @@ static void *net_thread(void *unused) {
             }
         /* What the guest sent since. */
         for (;;) {
-            pthread_mutex_lock(&to_host.mu);
-            Frame f = {0, NULL};
-            if (to_host.head != to_host.tail) f = to_host.f[to_host.head++ % QUEUE];
-            pthread_mutex_unlock(&to_host.mu);
+            Frame f = hv_netq_pop(&to_host);
             if (!f.data) break;
             slirp_input(slirp, f.data, (int)f.len);
             free(f.data);
@@ -265,16 +244,11 @@ static void transmit(void *opaque, const uint8_t *frame, uint32_t len) {
 void hv_net_poll(void) {
     if (!net) return;
     for (;;) {
-        pthread_mutex_lock(&to_guest.mu);
-        Frame f = {0, NULL};
-        if (to_guest.head != to_guest.tail) f = to_guest.f[to_guest.head % QUEUE];
-        pthread_mutex_unlock(&to_guest.mu);
+        Frame f = hv_netq_peek(&to_guest);
         if (!f.data) return;
         if (!hv_virtio_net_receive(net, f.data, f.len)) return; /* no buffer posted yet: try again later */
         hv_net_rx_frames++;
-        pthread_mutex_lock(&to_guest.mu);
-        to_guest.head++;
-        pthread_mutex_unlock(&to_guest.mu);
+        (void)hv_netq_pop(&to_guest);
         free(f.data);
     }
 }
@@ -283,11 +257,20 @@ int hv_net_attach(HvMachine *m, HvVirtioNet *n) {
     if (machine) return -1;
     machine = m;
     atomic_store(&stopping, 0);
-    hv_dns_proxy_start();
     hv_net_tx_frames = hv_net_rx_frames = 0;
-    pthread_mutex_init(&to_guest.mu, NULL);
-    pthread_mutex_init(&to_host.mu, NULL);
+    /* Opt-in burst buffering, bounded per direction. Leave upstream's 512-frame default until M1 A/B data. */
+    const char *queue_mode = getenv("HV_NET_QUEUE");
+    int extended = queue_mode && strcmp(queue_mode, "1") == 0;
+    if (hv_netq_init(&to_guest, extended) != 0) { machine = NULL; return -1; }
+    if (hv_netq_init(&to_host, extended) != 0) {
+        hv_netq_destroy(&to_guest);
+        machine = NULL;
+        return -1;
+    }
     queues_initialized = 1;
+    fprintf(stderr, "hengevm: net queue: %u frames%s per direction\n", to_guest.frame_limit,
+            extended ? ", 16 MiB payload cap" : " (upstream default)");
+    hv_dns_proxy_start();
     if (pipe(wake_pipe) != 0) { hv_net_detach(); return -1; }
     fcntl(wake_pipe[0], F_SETFL, O_NONBLOCK);
     fcntl(wake_pipe[1], F_SETFL, O_NONBLOCK);
@@ -342,9 +325,10 @@ void hv_net_detach(void) {
         Queue *queues[] = {&to_guest, &to_host};
         for (int i = 0; i < 2; i++) {
             Queue *q = queues[i];
-            while (q->head != q->tail) free(q->f[q->head++ % QUEUE].data);
-            pthread_mutex_destroy(&q->mu);
-            memset(q, 0, sizeof *q);
+            fprintf(stderr, "hengevm: net queue %s: dropped %llu, allocation failures %llu, peak payload %llu bytes\n",
+                    i == 0 ? "to guest" : "from guest", (unsigned long long)q->dropped,
+                    (unsigned long long)q->alloc_failed, (unsigned long long)q->peak_bytes);
+            hv_netq_destroy(q);
         }
         queues_initialized = 0;
     }
